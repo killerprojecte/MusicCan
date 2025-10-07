@@ -111,10 +111,10 @@ class MainActivity : ComponentActivity() {
         }
         // 启动镜像（使用已保存的包名）
         lifecycleScope.launch {
-            settingsRepository.targetPackagesFlow.collect { pkgs ->
+            settingsRepository.targetPackagesFlow.collect { packages ->
                 // 仅在监听服务已连接时刷新，避免 SecurityException
                 val app = (application as MusicCanApp)
-                app.updateTargetPackages(pkgs)
+                app.updateTargetPackages(packages)
             }
         }
     }
@@ -251,7 +251,13 @@ object ExtendIcons {
                     curveToRelative(0.29f, 0.25f, 0.54f, 0.73f, 0.54f, 1.48f)
                     curveToRelative(0f, 1.07f, -0.01f, 1.93f, -0.01f, 2.2f)
                     curveToRelative(0f, 0.21f, 0.15f, 0.46f, 0.55f, 0.38f)
-                    arcTo(8.01f, 8.01f, 0f, false, false, 16f, 8f)
+                    arcTo(
+                        8.01f, 8.01f, 0f,
+                        isMoreThanHalf = false,
+                        isPositiveArc = false,
+                        x1 = 16f,
+                        y1 = 8f
+                    )
                     curveToRelative(0f, -4.42f, -3.58f, -8f, -8f, -8f)
                 }
             }.build()
