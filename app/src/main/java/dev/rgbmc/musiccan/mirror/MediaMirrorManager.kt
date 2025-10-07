@@ -17,6 +17,10 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 
 class MediaMirrorManager(
     private val appContext: Context,
@@ -24,6 +28,9 @@ class MediaMirrorManager(
     private val mainHandler = Handler(Looper.getMainLooper())
     private val mediaSessionManager =
         appContext.getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+
+    // 协程作用域，用于异步操作
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     private var mirroredSession: MediaSession? = null
     private var targetPackages: Set<String> = emptySet()
@@ -50,8 +57,16 @@ class MediaMirrorManager(
     private var isLocalSeeking: Boolean = false
     private var localSeekPosition: Long = 0L
     private var localSeekStartTime: Long = 0L
-    // 移除主动进度计算，改为被动监听目标应用的状态变化
-    // private val progressTicker = object : Runnable { ... } // 已移除
+
+    // 会话竞争处理机制
+    private var lastUserActionTime: Long = 0L
+    private var sessionCompetitionMode: Boolean = false
+    private var competitionCheckCount: Int = 0
+    private val maxCompetitionChecks: Int = 12 // 增加检查次数，约24秒
+    private val competitionCheckInterval: Long = 2000L // 2秒检查一次
+    private var lastKnownTargetController: MediaController? = null
+    private var lastSeekActionTime: Long = 0L // 记录最后一次拖动操作时间
+    private var lastSkipActionTime: Long = 0L // 记录最后一次切换曲目操作时间
 
     // 定时覆盖检测器
     private val overrideTicker = Runnable {
@@ -59,6 +74,10 @@ class MediaMirrorManager(
             checkAndOverrideTargetController()
             // 同时同步最新的状态
             syncLatestTargetState()
+
+            // 智能会话竞争处理
+            handleSessionCompetition()
+
             scheduleNextOverrideCheck()
         }
     }
@@ -98,6 +117,9 @@ class MediaMirrorManager(
         activeController?.unregisterCallback(controllerCallback)
         activeController = null
         releaseLocalSession()
+
+        // 取消所有协程，确保资源清理
+        coroutineScope.coroutineContext.cancel()
     }
 
     fun updateTargetPackages(packages: Set<String>) {
@@ -147,11 +169,12 @@ class MediaMirrorManager(
                     callbackRegistered = true
                     Log.d("MediaMirror", "Registered callback for target controller")
                 }
+
+                // 立即同步当前状态，确保元数据正确传递
                 controllerCallback.onMetadataChanged(targetController.metadata)
                 controllerCallback.onPlaybackStateChanged(targetController.playbackState)
                 controllerCallback.onQueueChanged(targetController.queue)
 
-                // 移除主动进度计算
                 // 更新会话跳转意图，利于系统展示
                 mirroredSession?.setSessionActivity(getBestContentIntent(appContext))
                 notifyAllListeners()
@@ -179,6 +202,7 @@ class MediaMirrorManager(
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun ensureLocalSession() {
         if (mirroredSession == null) {
             mirroredSession = MediaSession(appContext, "MusicCanMirrorSession").apply {
@@ -192,6 +216,7 @@ class MediaMirrorManager(
                 setSessionActivity(getBestContentIntent(appContext))
                 setCallback(object : MediaSession.Callback() {
                     override fun onPlay() {
+                        recordUserAction()
                         targetController?.transportControls?.play()
                         Log.d(
                             "MediaMirror",
@@ -200,6 +225,7 @@ class MediaMirrorManager(
                     }
 
                     override fun onPause() {
+                        recordUserAction()
                         targetController?.transportControls?.pause()
                         Log.d(
                             "MediaMirror",
@@ -208,6 +234,7 @@ class MediaMirrorManager(
                     }
 
                     override fun onStop() {
+                        recordUserAction()
                         targetController?.transportControls?.stop()
                         Log.d(
                             "MediaMirror",
@@ -216,6 +243,8 @@ class MediaMirrorManager(
                     }
 
                     override fun onSkipToNext() {
+                        recordUserAction()
+                        recordSkipAction()
                         targetController?.transportControls?.skipToNext()
                         Log.d(
                             "MediaMirror",
@@ -224,6 +253,8 @@ class MediaMirrorManager(
                     }
 
                     override fun onSkipToPrevious() {
+                        recordUserAction()
+                        recordSkipAction()
                         targetController?.transportControls?.skipToPrevious()
                         Log.d(
                             "MediaMirror",
@@ -232,6 +263,7 @@ class MediaMirrorManager(
                     }
 
                     override fun onFastForward() {
+                        recordUserAction()
                         targetController?.transportControls?.fastForward()
                         Log.d(
                             "MediaMirror",
@@ -240,6 +272,7 @@ class MediaMirrorManager(
                     }
 
                     override fun onRewind() {
+                        recordUserAction()
                         targetController?.transportControls?.rewind()
                         Log.d(
                             "MediaMirror",
@@ -248,6 +281,8 @@ class MediaMirrorManager(
                     }
 
                     override fun onSeekTo(pos: Long) {
+                        recordUserAction()
+                        recordSeekAction()
                         // 开始本地拖动
                         startLocalSeek(pos)
                         // 同时发送到目标应用
@@ -356,6 +391,10 @@ class MediaMirrorManager(
     private val controllerCallback = object : MediaController.Callback() {
         override fun onMetadataChanged(metadata: MediaMetadata?) {
             val session = mirroredSession ?: return
+            Log.d(
+                "MediaMirror",
+                "Metadata changed: ${metadata?.getString(MediaMetadata.METADATA_KEY_TITLE)}"
+            )
             session.setMetadata(metadata)
             session.setSessionActivity(getBestContentIntent(appContext))
             notifyAllListeners()
@@ -364,8 +403,41 @@ class MediaMirrorManager(
         override fun onPlaybackStateChanged(state: PlaybackState?) {
             val session = mirroredSession ?: return
 
-            // 如果正在本地拖动，忽略来自后端的进度更新
+            // 如果正在本地拖动，进行智能回弹检测
             if (isLocalSeeking) {
+                val currentTime = SystemClock.elapsedRealtime()
+                val seekDuration = currentTime - localSeekStartTime
+
+                // 检查是否发生了回弹（目标应用的位置与我们的位置差异很大）
+                if (state != null && seekDuration > 1000L) { // 1秒后才开始检测回弹
+                    val positionDiff = kotlin.math.abs(state.position - localSeekPosition)
+                    //val timeDiff = currentTime - localSeekStartTime
+
+                    // 如果位置差异超过5秒，认为是回弹
+                    if (positionDiff > 5000L) {
+                        Log.d(
+                            "MediaMirror",
+                            "Seek bounce detected: target=${state.position}, local=$localSeekPosition, diff=$positionDiff"
+                        )
+
+                        // 重新发送拖动命令
+                        targetController?.transportControls?.seekTo(localSeekPosition)
+
+                        // 更新本地状态
+                        val newState = PlaybackState.Builder(state)
+                            .setState(
+                                state.state,
+                                localSeekPosition,
+                                state.playbackSpeed,
+                                SystemClock.elapsedRealtime()
+                            )
+                            .build()
+                        session.setPlaybackState(newState)
+                        notifyAllListeners()
+                        return
+                    }
+                }
+
                 Log.d("MediaMirror", "Ignoring backend state update during local seek")
                 return
             }
@@ -441,21 +513,28 @@ class MediaMirrorManager(
 
         // 如果目标控制器没有内容意图，使用包启动意图
         val pkg = targetController?.packageName ?: return null
-        val launch = context.packageManager.getLaunchIntentForPackage(pkg)
-            ?: run {
-                // 尝试显式 MAIN/LAUNCHER
-                val intent = Intent(Intent.ACTION_MAIN)
-                intent.addCategory(Intent.CATEGORY_LAUNCHER)
-                intent.`package` = pkg
-                intent
-            }
-        launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
-        return PendingIntent.getActivity(
-            context,
-            0,
-            launch,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+
+        // 在IO线程中查询包管理器（避免阻塞主线程）
+        return try {
+            val launch = context.packageManager.getLaunchIntentForPackage(pkg)
+                ?: run {
+                    // 尝试显式 MAIN/LAUNCHER
+                    val intent = Intent(Intent.ACTION_MAIN)
+                    intent.addCategory(Intent.CATEGORY_LAUNCHER)
+                    intent.`package` = pkg
+                    intent
+                }
+            launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+            PendingIntent.getActivity(
+                context,
+                0,
+                launch,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+        } catch (e: Exception) {
+            Log.e("MediaMirror", "Error getting content intent for package: $pkg", e)
+            null
+        }
     }
 
     fun updateNotificationIcons(smallIcon: android.graphics.Bitmap?) {
@@ -504,7 +583,9 @@ class MediaMirrorManager(
      */
     private fun scheduleNextOverrideCheck() {
         if (overrideTickerRunning) {
-            mainHandler.postDelayed(overrideTicker, 2000) // 每2秒检测一次
+            // 在竞争模式下使用更短的间隔，否则使用正常间隔
+            val interval = if (sessionCompetitionMode) competitionCheckInterval else 2000L
+            mainHandler.postDelayed(overrideTicker, interval)
         }
     }
 
@@ -615,10 +696,10 @@ class MediaMirrorManager(
             }
         }
 
-        // 设置一个定时器，在一定时间后停止本地拖动模式
+        // 延长本地拖动模式时间，减少回弹概率
         mainHandler.postDelayed({
             stopLocalSeek()
-        }, 2000) // 2秒后停止本地拖动模式
+        }, 5000) // 5秒后停止本地拖动模式，给目标应用更多时间响应
     }
 
     private fun stopLocalSeek() {
@@ -780,6 +861,125 @@ class MediaMirrorManager(
         } catch (e: Exception) {
             Log.e("MediaMirror", "Error syncing latest target state", e)
         }
+    }
+
+    /**
+     * 智能会话竞争处理
+     * 检测并处理目标应用重新获得会话控制权的情况
+     */
+    private fun handleSessionCompetition() {
+        try {
+            val currentTime = System.currentTimeMillis()
+
+            // 性能优化：只在必要时获取会话信息
+            if (!sessionCompetitionMode && (currentTime - lastUserActionTime) > 15000L) {
+                return // 没有竞争模式且超过15秒无操作，直接返回
+            }
+
+            val componentName = registeredComponent ?: return
+
+            // 获取当前活跃的会话
+            val activeSessions = mediaSessionManager.getActiveSessions(componentName)
+            val target = targetPackages
+
+            // 查找目标应用的当前会话
+            val currentTargetSession = activeSessions
+                .sortedByDescending { c -> (c.playbackState?.state == PlaybackState.STATE_PLAYING) }
+                .firstOrNull { c ->
+                    target.isEmpty() || target.contains(c.packageName)
+                }
+
+            // 检查是否发生了会话竞争
+            val sessionChanged = currentTargetSession != lastKnownTargetController
+
+            val recentSeekAction = (currentTime - lastSeekActionTime) < 15000L
+            val recentSkipAction = (currentTime - lastSkipActionTime) < 15000L
+
+            if (sessionChanged && currentTargetSession != null) {
+                Log.d(
+                    "MediaMirror",
+                    "Session competition detected: ${currentTargetSession.packageName}"
+                )
+
+                // 性能优化：缓存时间计算，避免重复计算
+                val recentUserAction = (currentTime - lastUserActionTime) < 10000L
+
+                // 如果最近有用户操作，特别是拖动或切换曲目，进入竞争模式
+                if (recentUserAction || recentSeekAction || recentSkipAction) {
+                    sessionCompetitionMode = true
+                    competitionCheckCount = 0
+                    Log.d(
+                        "MediaMirror",
+                        "Entering session competition mode (User: $recentUserAction, Seek: $recentSeekAction, Skip: $recentSkipAction)"
+                    )
+                }
+
+                // 更新已知的目标控制器
+                lastKnownTargetController = currentTargetSession
+            }
+
+            // 在竞争模式下，更频繁地检查并重新覆盖
+            if (sessionCompetitionMode) {
+                competitionCheckCount++
+
+                if (competitionCheckCount <= maxCompetitionChecks) {
+                    // 重新覆盖目标会话
+                    updateActiveController(activeSessions)
+                    Log.d("MediaMirror", "Re-overriding session (attempt $competitionCheckCount)")
+
+                    // 性能优化：根据操作类型调整检查间隔，减少不必要的检查
+                    val interval = when {
+                        recentSeekAction -> 1000L // 拖动操作后使用1秒间隔
+                        recentSkipAction -> 1500L // 切换曲目后使用1.5秒间隔
+                        else -> competitionCheckInterval // 其他操作使用2秒间隔
+                    }
+
+                    // 在竞争模式下使用调整后的检查间隔
+                    if (overrideTickerRunning) {
+                        mainHandler.removeCallbacks(overrideTicker)
+                        mainHandler.postDelayed(overrideTicker, interval)
+                    }
+                } else {
+                    // 退出竞争模式
+                    sessionCompetitionMode = false
+                    competitionCheckCount = 0
+                    Log.d("MediaMirror", "Exiting session competition mode")
+                }
+            }
+
+        } catch (e: Exception) {
+            Log.e("MediaMirror", "Error handling session competition", e)
+        }
+    }
+
+    /**
+     * 记录用户操作时间
+     * 用于判断是否进入会话竞争模式
+     */
+    private fun recordUserAction() {
+        lastUserActionTime = System.currentTimeMillis()
+        // 性能优化：减少日志输出
+        // Log.d("MediaMirror", "User action recorded at $lastUserActionTime")
+    }
+
+    /**
+     * 记录拖动操作时间
+     * 拖动操作更容易被抢占，需要更长的保护时间
+     */
+    private fun recordSeekAction() {
+        lastSeekActionTime = System.currentTimeMillis()
+        // 性能优化：减少日志输出
+        // Log.d("MediaMirror", "Seek action recorded at $lastSeekActionTime")
+    }
+
+    /**
+     * 记录切换曲目操作时间
+     * 切换曲目操作也容易被抢占，需要特别保护
+     */
+    private fun recordSkipAction() {
+        lastSkipActionTime = System.currentTimeMillis()
+        // 性能优化：减少日志输出
+        // Log.d("MediaMirror", "Skip action recorded at $lastSkipActionTime")
     }
 }
 

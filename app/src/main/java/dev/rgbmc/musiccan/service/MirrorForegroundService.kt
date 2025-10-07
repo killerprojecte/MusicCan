@@ -20,10 +20,17 @@ import com.luna.music.R
 import dev.rgbmc.musiccan.MainActivity
 import dev.rgbmc.musiccan.MusicCanApp
 import dev.rgbmc.musiccan.mirror.MediaMirrorManager
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 
 class MirrorForegroundService : Service(), MediaMirrorManager.MirrorNotificationListener {
     private val channelId = "mirror_media_channel"
     private val notifId = 1001
+
+    // 协程作用域，用于异步操作
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
     // 通知缓存和复用
     private var lastNotification: Notification? = null
@@ -34,27 +41,44 @@ class MirrorForegroundService : Service(), MediaMirrorManager.MirrorNotification
     // 性能统计
     private var notificationBuildCount = 0
     private var notificationReuseCount = 0
-    private var cooldownSkipCount = 0
 
     // 冷却机制
     private var lastUpdateTime = 0L
-    private val updateCooldownMs = 500L // 1秒冷却间隔
 
     // 应用包名缓存
     private var cachedPackageName: String? = null
 
     override fun onCreate() {
         super.onCreate()
-        createChannel()
-        resetCooldown() // 重置冷却时间，确保首次更新能立即执行
-        getCurrentPackageName() // 初始化包名缓存
-        (application as? MusicCanApp)?.mediaMirrorManager?.registerNotificationListener(this)
-        startForeground(notifId, buildNotification(null, null, null))
+
+        // 立即调用 startForeground，避免超时
+        try {
+            createChannel()
+            val startupNotification = createStartupNotification()
+            startForeground(notifId, startupNotification)
+
+            // 在 startForeground 之后进行其他初始化
+            resetCooldown() // 重置冷却时间，确保首次更新能立即执行
+            getCurrentPackageName() // 初始化包名缓存
+            (application as? MusicCanApp)?.mediaMirrorManager?.registerNotificationListener(this)
+        } catch (e: Exception) {
+            Log.e("ForegroundSrv", "Error in onCreate", e)
+            // 即使出错也要确保服务能启动
+            try {
+                val fallbackNotification = createFallbackNotification()
+                startForeground(notifId, fallbackNotification)
+            } catch (fallbackException: Exception) {
+                Log.e("ForegroundSrv", "Fallback notification failed", fallbackException)
+            }
+        }
     }
 
     override fun onDestroy() {
         (application as? MusicCanApp)?.mediaMirrorManager?.unregisterNotificationListener(this)
         clearNotificationCache()
+
+        // 取消所有协程，确保资源清理
+        coroutineScope.coroutineContext.cancel()
         super.onDestroy()
     }
 
@@ -120,14 +144,19 @@ class MirrorForegroundService : Service(), MediaMirrorManager.MirrorNotification
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // 初次启动时如果已有会话，立即刷新一次通知
-        val app = (application as? MusicCanApp)
-        if (app != null) {
-            val token = app.mediaMirrorManager.getSessionToken()
-            val metadata = app.mediaMirrorManager.getCurrentMetadata()
-            val state = app.mediaMirrorManager.getCurrentPlaybackState()
-            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            nm.notify(notifId, buildNotification(token, metadata, state))
+        try {
+            // 初次启动时如果已有会话，立即刷新一次通知
+            val app = (application as? MusicCanApp)
+            if (app != null) {
+                val token = app.mediaMirrorManager.getSessionToken()
+                val metadata = app.mediaMirrorManager.getCurrentMetadata()
+                val state = app.mediaMirrorManager.getCurrentPlaybackState()
+                val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                nm.notify(notifId, buildNotification(token, metadata, state))
+            }
+        } catch (e: Exception) {
+            Log.e("ForegroundSrv", "Error in onStartCommand", e)
+            // 即使出错也要确保服务继续运行
         }
         return START_STICKY
     }
@@ -143,6 +172,38 @@ class MirrorForegroundService : Service(), MediaMirrorManager.MirrorNotification
         nm.createNotificationChannel(ch)
     }
 
+    private fun createStartupNotification(): Notification {
+        val contentIntent = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        return NotificationCompat.Builder(this, channelId)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText("正在启动媒体镜像服务...")
+            .setContentIntent(contentIntent)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setSmallIcon(R.mipmap.ic_launcher_foreground) // 使用默认图标
+            .build()
+    }
+
+    private fun createFallbackNotification(): Notification {
+        // 最简单的备用通知，确保服务能启动
+        return NotificationCompat.Builder(this, channelId)
+            .setContentTitle("MusicCan")
+            .setContentText("媒体镜像服务")
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setSmallIcon(R.mipmap.ic_launcher_foreground)
+            .build()
+    }
+
     private fun buildNotification(
         token: MediaSession.Token?,
         metadata: MediaMetadata?,
@@ -155,7 +216,6 @@ class MirrorForegroundService : Service(), MediaMirrorManager.MirrorNotification
         val subtitle = metadata?.getString(MediaMetadata.METADATA_KEY_ARTIST) ?: ""
         val isPlaying = state?.state == PlaybackState.STATE_PLAYING
         val app = (application as? MusicCanApp)
-        val extractedSmallIcon = app?.mediaMirrorManager?.getExtractedSmallIcon()
 
         // 检查是否可以复用上一条通知
         if (canReuseLastNotification(title, subtitle, isPlaying)) {
@@ -181,6 +241,9 @@ class MirrorForegroundService : Service(), MediaMirrorManager.MirrorNotification
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
             )
 
+        // 同步获取图标，确保通知构建时有有效图标
+        val extractedSmallIcon = app?.mediaMirrorManager?.getExtractedSmallIcon()
+
         val builder = NotificationCompat.Builder(this, channelId)
             .setContentTitle(title)
             .setContentText(subtitle)
@@ -192,6 +255,7 @@ class MirrorForegroundService : Service(), MediaMirrorManager.MirrorNotification
             .setCategory(NotificationCompat.CATEGORY_TRANSPORT) // 设置为传输类别
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC) // 设置为公开可见
 
+        // 设置图标
         if (extractedSmallIcon != null) {
             builder.setSmallIcon(IconCompat.createWithBitmap(extractedSmallIcon))
         } else {

@@ -11,8 +11,17 @@ import android.service.notification.StatusBarNotification
 import android.util.Log
 import androidx.core.graphics.createBitmap
 import dev.rgbmc.musiccan.MusicCanApp
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MusicNotificationListenerService : NotificationListenerService() {
+    // 协程作用域，用于异步操作
+    private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
     override fun onListenerConnected() {
         super.onListenerConnected()
         (application as? MusicCanApp)?.startMirror(ComponentName(this, javaClass), null)
@@ -31,6 +40,12 @@ class MusicNotificationListenerService : NotificationListenerService() {
         super.onNotificationRemoved(sbn)
         Log.d("Notif", "Removed: " + sbn?.packageName)
         (application as? MusicCanApp)?.refreshSessionsFromService(ComponentName(this, javaClass))
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // 取消所有协程，确保资源清理
+        coroutineScope.coroutineContext.cancel()
     }
 
     private fun suppressTargetNotifications() {
@@ -58,20 +73,28 @@ class MusicNotificationListenerService : NotificationListenerService() {
         val notification = sbn?.notification ?: return
         val app = (application as? MusicCanApp)
 
-        try {
-            // 提取小图标
-            val smallIcon = notification.smallIcon
-            val smallIconBitmap = smallIcon?.let { drawableToBitmap(it.loadDrawable(this)) }
+        // 异步处理图标提取，避免阻塞主线程
+        coroutineScope.launch {
+            try {
+                // 在IO线程中提取图标
+                val smallIconBitmap = withContext(Dispatchers.IO) {
+                    val smallIcon = notification.smallIcon
+                    smallIcon?.let { drawableToBitmap(it.loadDrawable(this@MusicNotificationListenerService)) }
+                }
 
-            // 将图标信息传递给MediaMirrorManager
-            app?.mediaMirrorManager?.updateNotificationIcons(smallIconBitmap)
+                // 在主线程中更新UI
+                withContext(Dispatchers.Main) {
+                    // 将图标信息传递给MediaMirrorManager
+                    app?.mediaMirrorManager?.updateNotificationIcons(smallIconBitmap)
 
-            Log.d(
-                "NotifIcons",
-                "Extracted icons for ${sbn.packageName}: small=${smallIconBitmap != null}"
-            )
-        } catch (e: Exception) {
-            Log.e("NotifIcons", "Failed to extract icons", e)
+                    Log.d(
+                        "NotifIcons",
+                        "Extracted icons for ${sbn.packageName}: small=${smallIconBitmap != null}"
+                    )
+                }
+            } catch (e: Exception) {
+                Log.e("NotifIcons", "Failed to extract icons", e)
+            }
         }
     }
 

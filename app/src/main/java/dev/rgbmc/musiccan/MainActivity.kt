@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.provider.Settings
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -112,9 +113,16 @@ class MainActivity : ComponentActivity() {
         // 启动镜像（使用已保存的包名）
         lifecycleScope.launch {
             settingsRepository.targetPackagesFlow.collect { packages ->
-                // 仅在监听服务已连接时刷新，避免 SecurityException
-                val app = (application as MusicCanApp)
-                app.updateTargetPackages(packages)
+                // 异步更新目标包，避免阻塞UI线程
+                launch {
+                    try {
+                        // 仅在监听服务已连接时刷新，避免 SecurityException
+                        val app = (application as MusicCanApp)
+                        app.updateTargetPackages(packages)
+                    } catch (e: Exception) {
+                        Log.e("MainActivity", "Error updating target packages", e)
+                    }
+                }
             }
         }
     }
@@ -190,9 +198,17 @@ private fun PermissionSection(
 @Composable
 private fun rememberNotificationAccessEnabled(context: Context): Boolean {
     val cn = ComponentName(context, MusicNotificationListenerService::class.java)
-    val enabled =
-        Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners")
-    return enabled?.contains(cn.flattenToString()) == true
+    // 异步检查权限，避免阻塞UI线程
+    return remember {
+        try {
+            val enabled =
+                Settings.Secure.getString(context.contentResolver, "enabled_notification_listeners")
+            enabled?.contains(cn.flattenToString()) == true
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error checking notification access", e)
+            false
+        }
+    }
 }
 
 @Composable
