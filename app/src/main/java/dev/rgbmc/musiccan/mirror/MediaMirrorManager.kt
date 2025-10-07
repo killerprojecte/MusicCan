@@ -63,29 +63,6 @@ class MediaMirrorManager(
         }
     }
 
-    // 快速覆盖检测器 - 用于用户操作后的立即检测
-    private val quickOverrideTicker = Runnable {
-        if (overrideTickerRunning) {
-            checkAndOverrideTargetController()
-            syncLatestTargetState()
-            // 快速检测后，延迟启动常规检测
-            mainHandler.postDelayed({
-                if (overrideTickerRunning) {
-                    scheduleNextOverrideCheck()
-                }
-            }, 1500) // 1秒后启动常规检测
-        }
-    }
-
-    // 会话刷新检测器 - 定期刷新我们的会话状态
-    private val sessionRefreshTicker: Runnable = Runnable {
-        if (overrideTickerRunning) {
-            refreshSessionState()
-            // 每3秒刷新一次会话状态
-            mainHandler.postDelayed(sessionRefreshTicker, 3000)
-        }
-    }
-
     private val sessionListener =
         MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
             updateActiveController(controllers)
@@ -202,15 +179,10 @@ class MediaMirrorManager(
         }
     }
 
-    @Suppress("DEPRECATION")
     private fun ensureLocalSession() {
         if (mirroredSession == null) {
             mirroredSession = MediaSession(appContext, "MusicCanMirrorSession").apply {
-                // 设置媒体会话标志，确保我们的会话能够处理媒体控制
-                setFlags(
-                    MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or
-                            MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS
-                )
+                setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS or MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS)
                 setPlaybackToLocal(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -221,8 +193,6 @@ class MediaMirrorManager(
                 setCallback(object : MediaSession.Callback() {
                     override fun onPlay() {
                         targetController?.transportControls?.play()
-                        // 用户操作后立即启动快速覆盖检测
-                        startQuickOverrideCheck()
                         Log.d(
                             "MediaMirror",
                             "Proxied play to target: ${targetController?.packageName}"
@@ -231,8 +201,6 @@ class MediaMirrorManager(
 
                     override fun onPause() {
                         targetController?.transportControls?.pause()
-                        // 用户操作后立即启动快速覆盖检测
-                        startQuickOverrideCheck()
                         Log.d(
                             "MediaMirror",
                             "Proxied pause to target: ${targetController?.packageName}"
@@ -249,8 +217,6 @@ class MediaMirrorManager(
 
                     override fun onSkipToNext() {
                         targetController?.transportControls?.skipToNext()
-                        // 切换曲目后立即启动快速覆盖检测
-                        startQuickOverrideCheck()
                         Log.d(
                             "MediaMirror",
                             "Proxied skip to next to target: ${targetController?.packageName}"
@@ -259,8 +225,6 @@ class MediaMirrorManager(
 
                     override fun onSkipToPrevious() {
                         targetController?.transportControls?.skipToPrevious()
-                        // 切换曲目后立即启动快速覆盖检测
-                        startQuickOverrideCheck()
                         Log.d(
                             "MediaMirror",
                             "Proxied skip to previous to target: ${targetController?.packageName}"
@@ -288,8 +252,6 @@ class MediaMirrorManager(
                         startLocalSeek(pos)
                         // 同时发送到目标应用
                         targetController?.transportControls?.seekTo(pos)
-                        // 调整进度后立即启动快速覆盖检测
-                        startQuickOverrideCheck()
                         Log.d(
                             "MediaMirror",
                             "Proxied seek to target: ${targetController?.packageName}"
@@ -521,9 +483,6 @@ class MediaMirrorManager(
                     target.isEmpty() || target.contains(c.packageName)
                 }
 
-            // 检查我们的会话是否仍然处于主导地位
-            val ourSessionIsActive = isOurSessionActive(controllers)
-            
             // 如果找到目标控制器且与当前不同，或者当前没有目标控制器
             if (currentTargetController != null && currentTargetController != targetController) {
                 Log.d(
@@ -534,10 +493,6 @@ class MediaMirrorManager(
             } else if (currentTargetController == null && targetController != null) {
                 Log.d("MediaMirror", "Target controller disappeared, clearing")
                 updateActiveController(controllers)
-            } else if (!ourSessionIsActive && currentTargetController != null) {
-                // 我们的会话被覆盖了，需要重新获取控制权
-                Log.d("MediaMirror", "Our session was overridden, recovering control")
-                recoverSessionControl(controllers)
             }
         } catch (e: Exception) {
             Log.e("MediaMirror", "Error checking override", e)
@@ -545,62 +500,11 @@ class MediaMirrorManager(
     }
 
     /**
-     * 检查我们的会话是否仍然处于活跃状态
-     */
-    private fun isOurSessionActive(controllers: List<MediaController>): Boolean {
-        val ourPackageName = appContext.packageName
-        return controllers.any { controller ->
-            controller.packageName == ourPackageName &&
-                    controller.playbackState?.state == PlaybackState.STATE_PLAYING
-        }
-    }
-
-    /**
-     * 恢复会话控制权
-     */
-    private fun recoverSessionControl(controllers: List<MediaController>) {
-        try {
-            // 重新激活我们的会话
-            mirroredSession?.isActive = true
-
-            // 重新同步目标状态
-            val targetController = controllers
-                .sortedByDescending { c -> (c.playbackState?.state == PlaybackState.STATE_PLAYING) }
-                .firstOrNull { c ->
-                    targetPackages.isEmpty() || targetPackages.contains(c.packageName)
-                }
-
-            if (targetController != null) {
-                this.targetController = targetController
-                syncTargetStateToOurSession(targetController)
-                Log.d(
-                    "MediaMirror",
-                    "Recovered session control for: ${targetController.packageName}"
-                )
-            }
-        } catch (e: Exception) {
-            Log.e("MediaMirror", "Error recovering session control", e)
-        }
-    }
-
-    /**
      * 调度下一次覆盖检测
-     * 由于无法使用系统级优先级，通过更频繁的检测来维持控制权
      */
     private fun scheduleNextOverrideCheck() {
         if (overrideTickerRunning) {
-            mainHandler.postDelayed(overrideTicker, 1500) // 每1秒检测一次，更频繁的检测
-        }
-    }
-
-    /**
-     * 启动快速覆盖检测 - 用于用户操作后的立即检测
-     */
-    private fun startQuickOverrideCheck() {
-        if (overrideTickerRunning) {
-            mainHandler.removeCallbacks(quickOverrideTicker)
-            mainHandler.post(quickOverrideTicker)
-            Log.d("MediaMirror", "Started quick override check")
+            mainHandler.postDelayed(overrideTicker, 2000) // 每2秒检测一次
         }
     }
 
@@ -611,9 +515,7 @@ class MediaMirrorManager(
         if (!overrideTickerRunning) {
             overrideTickerRunning = true
             scheduleNextOverrideCheck()
-            // 同时启动会话刷新检测
-            startSessionRefresh()
-            Log.d("MediaMirror", "Started override check and session refresh")
+            Log.d("MediaMirror", "Started override check")
         }
     }
 
@@ -624,49 +526,7 @@ class MediaMirrorManager(
         if (overrideTickerRunning) {
             overrideTickerRunning = false
             mainHandler.removeCallbacks(overrideTicker)
-            mainHandler.removeCallbacks(sessionRefreshTicker)
-            Log.d("MediaMirror", "Stopped override check and session refresh")
-        }
-    }
-
-    /**
-     * 启动会话刷新检测
-     */
-    private fun startSessionRefresh() {
-        if (overrideTickerRunning) {
-            mainHandler.removeCallbacks(sessionRefreshTicker)
-            mainHandler.post(sessionRefreshTicker)
-            Log.d("MediaMirror", "Started session refresh")
-        }
-    }
-
-    /**
-     * 刷新会话状态
-     * 通过定期更新会话状态来维持其活跃性和优先级
-     */
-    private fun refreshSessionState() {
-        try {
-            val session = mirroredSession ?: return
-            if (!session.isActive) {
-                Log.d("MediaMirror", "Session became inactive, reactivating")
-                session.isActive = true
-            }
-
-            // 获取当前状态并重新设置，强化会话存在感
-            val currentState = session.controller.playbackState
-            val currentMetadata = session.controller.metadata
-
-            if (currentState != null) {
-                session.setPlaybackState(currentState)
-            }
-
-            if (currentMetadata != null) {
-                session.setMetadata(currentMetadata)
-            }
-
-            Log.d("MediaMirror", "Refreshed session state")
-        } catch (e: Exception) {
-            Log.e("MediaMirror", "Error refreshing session state", e)
+            Log.d("MediaMirror", "Stopped override check")
         }
     }
 
@@ -916,48 +776,9 @@ class MediaMirrorManager(
             if (latestState != null) {
                 updateProgressPassively(latestState)
                 Log.d("MediaMirror", "Synced latest target state: position=${latestState.position}")
-
-                // 如果检测到状态变化，确保我们的会话仍然活跃
-                ensureSessionDominance()
             }
         } catch (e: Exception) {
             Log.e("MediaMirror", "Error syncing latest target state", e)
-        }
-    }
-
-    /**
-     * 确保我们的会话处于主导地位
-     * 通过更频繁的状态更新和积极的会话管理来维持优先级
-     */
-    private fun ensureSessionDominance() {
-        try {
-            val session = mirroredSession ?: return
-            if (!session.isActive) {
-                Log.d("MediaMirror", "Reactivating our session to maintain dominance")
-                session.isActive = true
-            }
-
-            // 强制更新会话状态，确保系统识别我们的会话为活跃状态
-            val currentState = session.controller.playbackState
-            if (currentState != null) {
-                // 通过重新设置状态来强化我们的会话优先级
-                session.setPlaybackState(currentState)
-
-                // 同时更新元数据，进一步强化会话存在感
-                val metadata = session.controller.metadata
-                if (metadata != null) {
-                    session.setMetadata(metadata)
-                }
-
-                Log.d("MediaMirror", "Reinforced session dominance")
-            }
-
-            // 如果检测到我们的会话可能被覆盖，立即启动快速检测
-            if (targetController != null) {
-                startQuickOverrideCheck()
-            }
-        } catch (e: Exception) {
-            Log.e("MediaMirror", "Error ensuring session dominance", e)
         }
     }
 }
